@@ -1,0 +1,439 @@
+name: Validate & Merge Homework PR
+
+on:
+  pull_request_target:
+    branches: [master]
+    types: [opened, synchronize, reopened]
+    paths:
+      - "*/*/homeworks/**"
+
+permissions:
+  pull-requests: write
+  contents: write
+
+jobs:
+  distribute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      # Step 1: Checkout code
+      # allow-unsafe-pr-checkout is required to check out a fork's PR head under
+      # pull_request_target. Safe here because this workflow never executes any
+      # code from the PR - it only reads .md files with grep/sed for validation,
+      # and permission checks (Steps 5-6) run before anything else happens.
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          allow-unsafe-pr-checkout: true
+
+      # Step 2: Extract branch name
+      - name: Extract branch info
+        id: branch_info
+        run: |
+          BRANCH="${{ github.head_ref }}"
+          echo "Branch: $BRANCH"
+
+          # Parse: {subject}/{course}/homework
+          if [[ $BRANCH =~ ^([a-z-]+)/([a-zA-Z0-9.]+)/homework$ ]]; then
+            SUBJECT="${BASH_REMATCH[1]}"
+            COURSE="${BASH_REMATCH[2]}"
+            echo "subject=$SUBJECT" >> $GITHUB_OUTPUT
+            echo "course=$COURSE" >> $GITHUB_OUTPUT
+            echo "is_valid=true" >> $GITHUB_OUTPUT
+            echo "✅ Valid branch: $SUBJECT / $COURSE"
+          else
+            echo "is_valid=false" >> $GITHUB_OUTPUT
+            echo "❌ Invalid branch format. Must be: {subject}/{course}/homework"
+            echo "   Example: c-advance/K26.1/homework"
+          fi
+
+      # Step 3: Reject if invalid branch
+      - name: Validate branch format
+        if: steps.branch_info.outputs.is_valid != 'true'
+        run: |
+          echo "❌ Branch validation failed"
+          echo ""
+          echo "Current branch: ${{ github.head_ref }}"
+          echo "Expected format: {subject}/{course}/homework"
+          echo ""
+          echo "Examples:"
+          echo "  ✅ c-advance/K26.1/homework"
+          echo "  ✅ embedded-linux/K26.2/homework"
+          echo "  ✅ embedded-mcu/K26.1/homework"
+          exit 1
+
+      # Step 4: Load teacher permissions
+      - name: Load teacher permissions
+        id: permissions
+        run: |
+          PERMISSIONS=$(git show origin/master:.github/teacher-permissions.json | jq -c .)
+          echo "permissions=$PERMISSIONS" >> $GITHUB_OUTPUT
+
+      # Step 5: Validate PR author
+      - name: Validate PR author
+        id: validate_author
+        run: |
+          AUTHOR="${{ github.actor }}"
+          PERMISSIONS='${{ steps.permissions.outputs.permissions }}'
+
+          echo "PR Author: $AUTHOR"
+
+          IS_TEACHER=$(python3 << 'EOF'
+          import json
+          import sys
+
+          try:
+            permissions = json.loads('''${{ steps.permissions.outputs.permissions }}''')
+            author = "${{ github.actor }}"
+
+            if author in permissions.get("teachers", {}):
+              print("true")
+            else:
+              print("false")
+          except:
+            print("false")
+          EOF
+          )
+
+          echo "is_teacher=$IS_TEACHER" >> $GITHUB_OUTPUT
+
+          if [ "$IS_TEACHER" = "true" ]; then
+            echo "✅ Author is a trusted teacher"
+          else
+            echo "❌ Author is NOT a trusted teacher"
+          fi
+
+      # Step 6: Validate course permission
+      - name: Validate course permission
+        id: validate_permission
+        if: steps.validate_author.outputs.is_teacher == 'true'
+        run: |
+          AUTHOR="${{ github.actor }}"
+          SUBJECT="${{ steps.branch_info.outputs.subject }}"
+          COURSE="${{ steps.branch_info.outputs.course }}"
+
+          HAS_PERMISSION=$(python3 << 'EOF'
+          import json
+
+          try:
+            permissions = json.loads('''${{ steps.permissions.outputs.permissions }}''')
+            author = "${{ github.actor }}"
+            subject = "${{ steps.branch_info.outputs.subject }}"
+            course = "${{ steps.branch_info.outputs.course }}"
+
+            teacher = permissions.get("teachers", {}).get(author, {})
+            courses = teacher.get(subject, [])
+
+            if course in courses:
+              print("true")
+            else:
+              print("false")
+          except:
+            print("false")
+          EOF
+          )
+
+          echo "has_permission=$HAS_PERMISSION" >> $GITHUB_OUTPUT
+
+          if [ "$HAS_PERMISSION" = "true" ]; then
+            echo "✅ Author has permission to edit $SUBJECT/$COURSE"
+          else
+            echo "❌ Author does NOT have permission to edit $SUBJECT/$COURSE"
+          fi
+
+      # Step 7: Get changed files
+      - name: Get changed files
+        id: changed_files
+        run: |
+          CHANGED=$(git diff --name-only origin/master...HEAD)
+
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGED" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      # Step 8: Validate file paths
+      - name: Validate file paths
+        id: validate_files
+        if: steps.validate_permission.outputs.has_permission == 'true'
+        run: |
+          SUBJECT="${{ steps.branch_info.outputs.subject }}"
+          COURSE="${{ steps.branch_info.outputs.course }}"
+          EXPECTED_PATH="${SUBJECT}/${COURSE}/homeworks/"
+
+          CHANGED_FILES="${{ steps.changed_files.outputs.files }}"
+
+          echo "Expected path: $EXPECTED_PATH"
+          echo ""
+          echo "Validating files:"
+
+          IS_VALID="true"
+
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+
+            if [[ "$file" == "${EXPECTED_PATH}"* ]]; then
+              echo "  ✅ $file"
+            else
+              echo "  ❌ $file (not in $EXPECTED_PATH)"
+              IS_VALID="false"
+            fi
+          done <<< "$CHANGED_FILES"
+
+          echo "is_valid=$IS_VALID" >> $GITHUB_OUTPUT
+
+      # Step 8b: Validate homework file format
+      - name: Validate homework file format
+        id: validate_homework_format
+        if: steps.validate_files.outputs.is_valid == 'true'
+        run: |
+          SUBJECT="${{ steps.branch_info.outputs.subject }}"
+          COURSE="${{ steps.branch_info.outputs.course }}"
+          HOMEWORK_DIR="${SUBJECT}/${COURSE}/homeworks"
+          CHANGED_FILES="${{ steps.changed_files.outputs.files }}"
+
+          echo "Validating only the homework files changed in this PR"
+          echo ""
+
+          VALIDATION_PASSED="true"
+
+          # Only validate session-*.md files that this PR actually touched
+          # (not every file already in homeworks/, which may predate these rules)
+          while IFS= read -r hw_file; do
+            [ -z "$hw_file" ] && continue
+            case "$hw_file" in
+              "$HOMEWORK_DIR"/session-*.md) ;;
+              *) continue ;;
+            esac
+            [ -f "$hw_file" ] || continue
+
+            filename=$(basename "$hw_file")
+            echo "📄 Checking: $filename"
+
+            # 1. Check line 2 has deadline in correct format
+            line2=$(sed -n '2p' "$hw_file")
+            if ! echo "$line2" | grep -qE '^\*\*Deadline: [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\*\*'; then
+              echo "  ❌ Line 2 must have deadline: \`**Deadline: YYYY-MM-DD HH:MM:SS**\`"
+              echo "     Current: $line2"
+              VALIDATION_PASSED="false"
+            else
+              echo "  ✅ Deadline format correct"
+            fi
+
+            # 2. Check all exercises have [build] or [review-only] tag
+            exercise_headers=$(grep "^## Exercise" "$hw_file")
+            if [ -n "$exercise_headers" ]; then
+              while IFS= read -r header; do
+                if ! echo "$header" | grep -qE "\[(build|review-only)\]"; then
+                  echo "  ❌ Exercise missing tag: $header"
+                  echo "     Must have [build] or [review-only] tag"
+                  VALIDATION_PASSED="false"
+                fi
+              done <<< "$exercise_headers"
+              if echo "$exercise_headers" | grep -qE "\[(build|review-only)\]"; then
+                echo "  ✅ All exercises have proper tags"
+              fi
+            fi
+
+            echo ""
+          done <<< "$CHANGED_FILES"
+
+          if [ "$VALIDATION_PASSED" = "true" ]; then
+            echo "✅ All homework files passed validation"
+            echo "is_valid_format=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Homework file validation failed"
+            echo "is_valid_format=false" >> $GITHUB_OUTPUT
+          fi
+
+      # Step 9: Check for symlinks
+      - name: Check for symlinks
+        id: check_symlinks
+        if: steps.validate_homework_format.outputs.is_valid_format == 'true'
+        run: |
+          SUBJECT="${{ steps.branch_info.outputs.subject }}"
+          COURSE="${{ steps.branch_info.outputs.course }}"
+          HOMEWORK_DIR="${SUBJECT}/${COURSE}/homeworks"
+
+          if [ ! -d "$HOMEWORK_DIR" ]; then
+            echo "❌ Directory not found: $HOMEWORK_DIR"
+            echo "has_symlinks=true" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          SYMLINKS=$(find "$HOMEWORK_DIR" -type l 2>/dev/null)
+
+          if [ -z "$SYMLINKS" ]; then
+            echo "✅ No symlinks found"
+            echo "has_symlinks=false" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Symlinks detected:"
+            echo "$SYMLINKS"
+            echo "has_symlinks=true" >> $GITHUB_OUTPUT
+          fi
+
+      # Step 11: Reject if any validation failed
+      - name: Reject PR if validation failed
+        if: |
+          steps.validate_author.outputs.is_teacher != 'true' ||
+          steps.validate_permission.outputs.has_permission != 'true' ||
+          steps.validate_files.outputs.is_valid != 'true' ||
+          steps.validate_homework_format.outputs.is_valid_format != 'true' ||
+          steps.check_symlinks.outputs.has_symlinks == 'true'
+        run: |
+          echo "❌ PR Validation Failed"
+          echo ""
+
+          if [ "${{ steps.validate_author.outputs.is_teacher }}" != "true" ]; then
+            echo "❌ Error: Author '${{ github.actor }}' is not a trusted teacher"
+          fi
+
+          if [ "${{ steps.validate_permission.outputs.has_permission }}" != "true" ]; then
+            echo "❌ Error: Author does not have permission to edit ${{ steps.branch_info.outputs.subject }}/${{ steps.branch_info.outputs.course }}"
+          fi
+
+          if [ "${{ steps.validate_files.outputs.is_valid }}" != "true" ]; then
+            echo "❌ Error: Files must be in ${{ steps.branch_info.outputs.subject }}/${{ steps.branch_info.outputs.course }}/homeworks/"
+          fi
+
+          if [ "${{ steps.validate_homework_format.outputs.is_valid_format }}" != "true" ]; then
+            echo "❌ Error: Homework file format validation failed"
+            echo "   - Line 2 must have deadline: \`**Deadline: YYYY-MM-DD HH:MM:SS**\`"
+            echo "   - All Exercises must have [\`build\`] or [\`review-only\`] tag"
+            echo "   Check the workflow log for details"
+          fi
+
+          if [ "${{ steps.check_symlinks.outputs.has_symlinks }}" = "true" ]; then
+            echo "❌ Error: Symlinks not allowed"
+          fi
+
+          exit 1
+
+      # Step 14: Auto-merge PR (GitHub rejects this automatically if there's a real
+      # merge conflict, which fails the step and triggers the failure comment below)
+      - name: Auto-merge PR
+        if: steps.validate_homework_format.outputs.is_valid_format == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.pulls.merge({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              merge_method: 'squash'
+            })
+            console.log('✅ PR auto-merged')
+
+      # Step 14b: Checkout master again now that the PR is merged. This is a
+      # fresh checkout of the real branch (not the PR head SHA / detached HEAD
+      # used above), so distributing and pushing from here is safe.
+      # NOTE: distribution runs here (not a separate push-triggered workflow)
+      # because the GITHUB_TOKEN used to merge above does not trigger other
+      # workflows - a push made via GITHUB_TOKEN is intentionally excluded
+      # from firing other workflows' `on: push` triggers.
+      - name: Checkout master after merge
+        if: steps.validate_homework_format.outputs.is_valid_format == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 1
+
+      # Step 14c: Distribute the newly merged homework to all students
+      - name: Distribute homework to students
+        if: steps.validate_homework_format.outputs.is_valid_format == 'true'
+        run: |
+          SUBJECT="${{ steps.branch_info.outputs.subject }}"
+          COURSE="${{ steps.branch_info.outputs.course }}"
+          COURSE_ARG="${SUBJECT}/${COURSE}"
+
+          echo "Running: bash distribute_homework.sh $COURSE_ARG"
+          bash distribute_homework.sh "$COURSE_ARG"
+
+          echo "✅ Homework distributed successfully"
+
+      # Step 14d: Commit and push. If another PR's distribution commit landed
+      # on master in between (rare race condition), retry once with rebase.
+      - name: Commit and push distributed files
+        if: steps.validate_homework_format.outputs.is_valid_format == 'true'
+        run: |
+          SUBJECT="${{ steps.branch_info.outputs.subject }}"
+          COURSE="${{ steps.branch_info.outputs.course }}"
+          COURSE_ARG="${SUBJECT}/${COURSE}"
+
+          git config user.email "devlinux-bot@devlinux.vn"
+          git config user.name "DevLinux Bot"
+
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "ℹ️  No changes to commit"
+            exit 0
+          fi
+
+          git add .
+          git commit -m "homework: distribute $COURSE_ARG to all students"
+
+          if git push origin HEAD:master; then
+            echo "✅ Distributed files committed and pushed"
+          else
+            echo "⚠️  Push rejected (likely a concurrent merge), retrying with rebase..."
+            git pull --rebase origin master
+            git push origin HEAD:master
+            echo "✅ Distributed files committed and pushed after retry"
+          fi
+
+      # Step 15: Comment success
+      - name: Comment success
+        if: steps.validate_homework_format.outputs.is_valid_format == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const subject = '${{ steps.branch_info.outputs.subject }}'
+            const course = '${{ steps.branch_info.outputs.course }}'
+
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `✅ **Homework Distribution Successful**
+
+            **Course:** ${subject}/${course}
+
+            **Actions completed:**
+            - ✅ Author verified
+            - ✅ Permissions validated
+            - ✅ Files validated
+            - ✅ Homework format validated (deadline, tags)
+            - ✅ No symlinks
+            - ✅ PR merged into master
+            - ✅ Homework distributed to all students
+
+            The homework has been automatically distributed to all students in the class.`
+            })
+
+      # Step 16: Comment failure
+      - name: Comment failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `❌ **Homework PR Rejected**
+
+            **Validation Requirements:**
+            - ✅ Branch name must be: \`{subject}/{course}/homework\`
+              - Example: \`c-advance/K26.1/homework\`
+            - ✅ Only author in the teacher whitelist can submit
+            - ✅ Author must have permission to edit the specified course
+            - ✅ Only files in \`{subject}/{course}/homeworks/\` can be modified
+            - ✅ No symlinks allowed
+            - ✅ Must be mergeable into master with no conflicts
+
+            **Please check the workflow logs for details.**`
+            })

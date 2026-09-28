@@ -1,0 +1,11 @@
+{
+  "teachers": {
+    "teacher-username-1": {
+      "c-advance": ["K26.1", "K26.2"],
+      "embedded-linux": ["K26.1"]
+    },
+    "quocviet1026": {
+       "embedded-linux": ["K26.1", "K26.2"]
+    }
+  }
+}
